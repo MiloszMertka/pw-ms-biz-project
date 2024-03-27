@@ -4,9 +4,9 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"os"
-	"regexp"
+	"slices"
 	"time"
+	"unicode"
 
 	_ "github.com/denisenkom/go-mssqldb"
 )
@@ -26,13 +26,14 @@ type WorkTime struct {
 }
 
 var validationErrors = []string{}
+var invalidEmployeeIds = []int64{}
 
 func main() {
-	server := os.Getenv("DB_SERVER")
-	port := os.Getenv("DB_PORT")
-	user := os.Getenv("DB_USER")
-	password := os.Getenv("DB_PASSWORD")
-	database := os.Getenv("DB_DATABASE")
+	server := "127.0.0.1"
+	port := "1433"
+	user := "sa"
+	password := "secret"
+	database := "msbiz"
 	driverName := "sqlserver"
 
 	connString := fmt.Sprintf("server=%s;user id=%s;password=%s;port=%s;database=%s;", server, user, password, port, database)
@@ -61,6 +62,7 @@ func main() {
 
 	for _, employee := range employees {
 		if !validateEmployee(&employee) {
+			invalidEmployeeIds = append(invalidEmployeeIds, employee.id)
 			continue
 		}
 
@@ -71,7 +73,11 @@ func main() {
 	}
 
 	for _, workTime := range workTimes {
-		if !validateWorkTime(&workTime) || !validateIntegrity(&workTime, &employees) {
+		if !validateWorkTime(&workTime) {
+			continue
+		}
+
+		if !validateIntegrity(&workTime, &employees) {
 			continue
 		}
 
@@ -174,13 +180,25 @@ func validateEmployee(employee *Employee) bool {
 		isValid = false
 	}
 
-	regex := regexp.MustCompile(`^[a-zA-Z\s]+$`)
-	if !regex.MatchString(employee.fullName) {
+	if !isFromLettersOnly(employee.fullName) {
 		logValidationError(fmt.Sprintf("Employee (id: %d); Employee full name contains invalid characters", employee.id))
 		isValid = false
 	}
 
 	return isValid
+}
+
+func isFromLettersOnly(s string) bool {
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			continue
+		}
+
+		if !unicode.IsLetter(r) {
+			return false
+		}
+	}
+	return true
 }
 
 func validateWorkTime(workTime *WorkTime) bool {
@@ -222,7 +240,7 @@ func validateIntegrity(workTime *WorkTime, employees *[]Employee) bool {
 	isValid := false
 
 	for _, employee := range *employees {
-		if employee.id == workTime.employeeId {
+		if employee.id == workTime.employeeId && !slices.Contains(invalidEmployeeIds, employee.id) {
 			isValid = true
 			break
 		}
@@ -240,7 +258,15 @@ func logValidationError(message string) {
 }
 
 func saveEmployee(conn *sql.DB, employee *Employee) error {
-	if _, err := conn.Exec("INSERT INTO dbo.employees (id, full_name) VALUES (?, ?)", employee.id, employee.fullName); err != nil {
+	stmt, err := conn.Prepare("INSERT INTO dbo.employees (employee_id, full_name) VALUES (@ID, @FullName)")
+	if err != nil {
+		return err
+	}
+
+	defer stmt.Close()
+
+	_, err = stmt.Exec(sql.Named("ID", employee.id), sql.Named("FullName", employee.fullName))
+	if err != nil {
 		return err
 	}
 
@@ -248,7 +274,33 @@ func saveEmployee(conn *sql.DB, employee *Employee) error {
 }
 
 func saveWorkTime(conn *sql.DB, workTime *WorkTime) error {
-	if _, err := conn.Exec("INSERT INTO dbo.worktimes (id, employee_id, start_date, start_time, stop_date, stop_time) VALUES (?, ?, ?, ?, ?, ?)", workTime.id, workTime.employeeId, workTime.startDate, workTime.startTime, workTime.stopDate, workTime.stopTime); err != nil {
+	stmt, err := conn.Prepare("INSERT INTO dbo.worktimes (id, employee_id, start_date, start_time, stop_date, stop_time) VALUES (@ID, @EmployeeID, @StartDate, @StartTime, @StopDate, @StopTime)")
+	if err != nil {
+		return err
+	}
+
+	defer stmt.Close()
+
+	startDate, err := time.Parse("2.01.2006", workTime.startDate)
+	if err != nil {
+		return err
+	}
+
+	stopDate, err := time.Parse("2.01.2006", workTime.stopDate)
+	if err != nil {
+		return err
+	}
+
+	startDateFormatted := startDate.Format("2006-01-02")
+	stopDateFormatted := stopDate.Format("2006-01-02")
+
+	_, err = stmt.Exec(sql.Named("ID", workTime.id),
+		sql.Named("EmployeeID", workTime.employeeId),
+		sql.Named("StartDate", startDateFormatted),
+		sql.Named("StartTime", workTime.startTime),
+		sql.Named("StopDate", stopDateFormatted),
+		sql.Named("StopTime", workTime.stopTime))
+	if err != nil {
 		return err
 	}
 
@@ -256,7 +308,15 @@ func saveWorkTime(conn *sql.DB, workTime *WorkTime) error {
 }
 
 func saveValidationError(conn *sql.DB, message string) error {
-	if _, err := conn.Exec("INSERT INTO dbo.validation_errors (message) VALUES (?)", message); err != nil {
+	stmt, err := conn.Prepare("INSERT INTO dbo.validation_errors (message) VALUES (@Message)")
+	if err != nil {
+		return err
+	}
+
+	defer stmt.Close()
+
+	_, err = stmt.Exec(sql.Named("Message", message))
+	if err != nil {
 		return err
 	}
 
